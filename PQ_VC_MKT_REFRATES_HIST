@@ -18,7 +18,6 @@
 // - Asset is upper-cased and trimmed. 
 // - Rows with null obs_date are dropped. 
 // ========================================== 
-
 let 
   // =============================== 
   // SETTINGS 
