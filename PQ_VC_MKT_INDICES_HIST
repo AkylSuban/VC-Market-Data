@@ -1,15 +1,24 @@
-let 
-  // =============================== 
-  //What this code does:
-  //    Finds all Excel tables whose names start with tbl_. 
-  //    Assumes each such table’s first two columns are Date and Value. 
-  //    Normalizes them into a single tidy fact table with columns: obs_date, asset, metric, type, value, unit. 
-  //    Derives metadata: 
-  //      - asset from the table name suffix (tbl_<ASSET> → <ASSET>). 
-  //      - type via your asset→bucket mapping (crypto/equity/bond). 
-  //      - metric fixed as "index_level" and unit looked up as "USD". 
-  //    Cleans & standardizes: parses dates/numbers safely, drops null dates, enforces column types, and combines all series into one table, sorted by date (desc), then asset, then metric. 
+// ========================================== 
+// PURPOSE 
+// Normalize all tables named like tbl_* into one tidy fact table of index levels. 
+// 
+// INPUTS 
+// - Excel.CurrentWorkbook() tables where Name starts with "tbl_*". 
+// - Each table’s first two columns are Date and Value. 
+// 
+// OUTPUT 
+// - Columns: obs_date (date), asset (text), metric (text = "index_level"), 
+//            type (text: crypto_index/equity_index/bond_index/unknown), 
+//            value (number), unit (text: "points"). 
+// - Sorted by obs_date desc, then asset, then metric. 
+// 
+// ASSUMPTIONS 
+// - Asset code is taken from the table name suffix after "tbl_" (e.g., tbl_SPX → SPX). 
+// - Date may be in multiple formats; ParseDate handles common variants. 
+// - Missing/invalid dates are dropped. 
+// ========================================== 
 
+let 
   // SETTINGS 
   // =============================== 
   // Asset groups used to tag each series 
@@ -103,7 +112,7 @@ let
   // =============================== 
   NoNullDate = Table.SelectRows(Combined, each [obs_date] <> null), 
   Typed = Table.TransformColumnTypes( 
-            NoNullDate,                                                   
+            NoNullDate, 
             { 
               {"obs_date", type date}, 
               {"asset",    type text}, 
