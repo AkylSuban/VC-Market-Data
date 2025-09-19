@@ -1,0 +1,119 @@
+let 
+  // =============================== 
+  //What this code does:
+  //    Finds all Excel tables whose names start with tbl_. 
+  //    Assumes each such table’s first two columns are Date and Value. 
+  //    Normalizes them into a single tidy fact table with columns: obs_date, asset, metric, type, value, unit. 
+  //    Derives metadata: 
+  //      - asset from the table name suffix (tbl_<ASSET> → <ASSET>). 
+  //      - type via your asset→bucket mapping (crypto/equity/bond). 
+  //      - metric fixed as "index_level" and unit looked up as "USD". 
+  //    Cleans & standardizes: parses dates/numbers safely, drops null dates, enforces column types, and combines all series into one table, sorted by date (desc), then asset, then metric. 
+
+  // SETTINGS 
+  // =============================== 
+  // Asset groups used to tag each series 
+  CryptoAssets = {"SPBTC","SPETH","SPCBDM","SPDCF"}, 
+  EquityAssets = {"SPX"}, 
+  BondAssets   = {"SPGOV_USD","SPUST_1_3Y"}, 
+  
+  // Map asset -> type label 
+  GetType = (asset as text) as text => 
+    let a = Text.Upper(Text.Trim(asset)) 
+    in  if      List.Contains(CryptoAssets, a) then "crypto_index" 
+        else if List.Contains(EquityAssets, a) then "equity_index" 
+        else if List.Contains(BondAssets,   a) then "bond_index" 
+        else "unknown", 
+  
+  // Unit per metric (only index_level is produced here) 
+  UnitByMetric     = [ index_level = "points" ], 
+  GetUnitByMetric  = (m as text) as nullable text => try Record.Field(UnitByMetric, m) otherwise null, 
+  
+  // =============================== 
+  // HELPERS 
+  // =============================== 
+  // Try a few ways to parse a date; return null if all fail 
+  ParseDate = (x as any) as nullable date => 
+    let 
+      d1 = try Date.From(x) otherwise null, 
+      d2 = if d1=null then try Date.From(DateTime.FromText(Text.From(x), "en-US")) otherwise null else d1, 
+      d3 = if d2=null then try Date.From(Date.FromText(Text.From(x))) otherwise null else d2 
+    in 
+      d3, 
+ 
+  // =============================== 
+  // SOURCE 
+  // =============================== 
+  // Expect Excel tables named like tbl_<ASSET>, first two cols = Date, Value 
+  WB     = Excel.CurrentWorkbook(), 
+  Tables = Table.SelectRows(WB, each Text.StartsWith([Name], "tbl_") and Value.Is([Content], type table)), 
+  
+  // =============================== 
+  // NORMALIZE ONE TABLE 
+  // → asset · type · metric · obs_date · value · unit 
+  // =============================== 
+  Normalize = (tbl as table, name as text) as table => 
+    let 
+      // Asset code comes from table name suffix after "tbl_" 
+      assetRaw = Text.AfterDelimiter(name, "tbl_"), 
+      asset    = Text.Upper(Text.Trim(assetRaw)), 
+  
+      // Keep first two columns only 
+      cols  = Table.ColumnNames(tbl), 
+      keep2 = if List.Count(cols) >= 2 
+              then Table.SelectColumns(tbl, {cols{0}, cols{1}}, MissingField.Ignore) 
+              else tbl, 
+  
+      // Rename to obs_date/value and parse types 
+      renamed = if List.Count(Table.ColumnNames(keep2)) >= 2 
+                then Table.RenameColumns(keep2, { {cols{0}, "obs_date"}, {cols{1}, "value"} }, MissingField.Ignore) 
+                else keep2, 
+      parsed  = Table.TransformColumns( 
+                  renamed, 
+                  { 
+                    {"obs_date", each ParseDate(_), type date}, 
+                    {"value",    each try Number.From(_) otherwise null, type number} 
+                  } 
+                ), 
+  
+      // Only keep index level metric
+      levels   = Table.AddColumn( 
+                   Table.SelectColumns(parsed, {"obs_date","value"}), 
+                   "metric", each "index_level", type text 
+                 ), 
+  
+      // Annotate with asset/type/unit 
+      withAsset = Table.AddColumn(levels, "asset", each asset, type text), 
+      withType  = Table.AddColumn(withAsset, "type", each GetType(asset), type text), 
+      withUnit  = Table.AddColumn(withType, "unit", each GetUnitByMetric([metric]), type text), 
+  
+      // Final column order 
+      final = Table.SelectColumns(withUnit, {"obs_date","asset","metric","type","value","unit"}) 
+    in 
+      final, 
+ 
+  // =============================== 
+  // APPLY TO ALL TABLES 
+  // =============================== 
+  Applied  = Table.AddColumn(Tables, "Normalized", each Normalize([Content], [Name])), 
+  Combined = Table.Combine(Applied[Normalized]), 
+ 
+  // =============================== 
+  // CLEANUP, TYPES, SORT 
+  // =============================== 
+  NoNullDate = Table.SelectRows(Combined, each [obs_date] <> null), 
+  Typed = Table.TransformColumnTypes( 
+            NoNullDate,                                                   
+            { 
+              {"obs_date", type date}, 
+              {"asset",    type text}, 
+              {"metric",   type text}, 
+              {"type",     type text}, 
+              {"value",    type number}, 
+              {"unit",     type text} 
+            } 
+          ), 
+  Sorted = Table.Sort(Typed, {{"obs_date", Order.Descending}, {"asset", Order.Ascending}, {"metric", Order.Ascending}}) 
+
+in 
+  Sorted
