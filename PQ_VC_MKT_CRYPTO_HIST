@@ -1,0 +1,164 @@
+// ========================================== 
+// PURPOSE 
+// Consolidate CoinGecko crypto market data (price, market cap, total volume) 
+// from tables named tbl_* into a tidy long format. 
+// 
+// INPUTS 
+// - Excel.CurrentWorkbook() tables where Name starts with "tbl_*". 
+// - Expected columns (any case/variant): date|snapped_at|DateTimeRaw, 
+//   price|prices, market_cap|market_caps, total_volume|total_volumes. 
+// 
+// OUTPUT 
+// - Columns: asset (text), type (text: coin|stablecoin|…), 
+//            metric (text: prices|market_caps|total_volumes), 
+//            obs_date (date), value (number), unit (text). 
+//   Units: prices = "USD per coin"; market_caps = "USD total"; 
+//          total_volumes = "USD traded". 
+// - Sorted by obs_date desc, then asset, then metric. 
+// 
+// ASSUMPTIONS 
+// - Asset comes from the table name suffix after "tbl_". 
+// - Dates may include timezone strings; parser normalizes to date. 
+// - If asset type not found in TypeMap, default is "coin". 
+// ========================================== 
+
+
+let 
+  // ------------------- 
+  // CONFIG 
+  // ------------------- 
+  // Map asset -> type (defaults to "coin" if not found) 
+
+  TypeMap = 
+    #table({"asset","type"}, 
+      { 
+        {"BTC","coin"}, 
+        {"ETH","coin"} 
+        // ,{"USDT","stablecoin"}, {"USDC","stablecoin"} 
+      } 
+    ), 
+
+  GetType = (asset as text) as text => 
+    let m = Table.SelectRows(TypeMap, each [asset] = asset) 
+    in  if Table.RowCount(m) = 1 then m{0}[type] else "coin", 
+  // ------------------- 
+  // SOURCE 
+  // ------------------- 
+  WB = Excel.CurrentWorkbook(), 
+  CryptoTables = 
+    Table.SelectRows( 
+      WB, 
+      each Value.Is([Content], type table) and Text.StartsWith([Name], "tbl_") 
+    ), 
+  // ------------------- 
+  // NORMALIZER -> asset | type | metric | date | value | unit 
+  // ------------------- 
+  fxNormalizeCrypto = (t as table, asset as text) as table => 
+    let 
+      // Trim header names 
+      T0 = Table.TransformColumnNames(t, each Text.Trim(_)), 
+      // Standardize to EXACT qAllCoins metric column names BEFORE unpivot 
+      // (tolerates common variants found in exports) 
+
+      Standardized = Table.RenameColumns( 
+        T0, 
+        { 
+          {"snapped_at",  "date"}, 
+          {"DateTimeRaw", "date"}, 
+          {"date",        "date"}, 
+          {"price",       "prices"}, 
+          {"Price",       "prices"}, 
+          {"market_cap",  "market_caps"}, 
+          {"MarketCap",   "market_caps"}, 
+          {"total_volume","total_volumes"}, 
+          {"TotalVolume", "total_volumes"} 
+        }, 
+        MissingField.Ignore 
+      ), 
+
+      // Keep only the fields we need 
+      Kept = Table.SelectColumns(Standardized, {"date","prices","market_caps","total_volumes"}, MissingField.Ignore), 
+      // Add asset & type 
+      WithAsset = Table.AddColumn(Kept, "asset", each asset, type text), 
+      WithType  = Table.AddColumn(WithAsset, "type", each GetType(asset), type text), 
+      // Parse date & numbers safely 
+
+      Parsed = 
+        let 
+          P1 = Table.TransformColumns( 
+                 WithType, 
+                 { 
+                   { 
+                     "date", 
+                     each 
+                       let s     = Text.From(_), 
+                           sTrim = Text.Trim(s), 
+                           sZ    = if Text.EndsWith(sTrim, "UTC") then Text.Replace(sTrim, " UTC", "Z") else sTrim 
+                       in 
+                         try Date.From(DateTimeZone.FromText(sZ)) 
+                         otherwise try Date.From(DateTime.FromText(sTrim)) 
+                         otherwise try Date.From(Text.Start(sTrim, 10)) 
+                         otherwise null, 
+                     type date 
+                   }, 
+                   {"prices",         each try Number.From(_) otherwise null, type number}, 
+                   {"market_caps",    each try Number.From(_) otherwise null, type number}, 
+                   {"total_volumes",  each try Number.From(_) otherwise null, type number} 
+                 } 
+               ) 
+
+        in  P1, 
+      // Unpivot using the ALREADY standardized names -> metric matches qAllCoins EXACTLY 
+
+      Long = Table.Unpivot( 
+               Parsed, 
+               {"prices","market_caps","total_volumes"}, 
+               "metric", 
+               "value" 
+             ), 
+
+      // Units to match qAllCoins exactly 
+      WithUnit = 
+        Table.AddColumn( 
+          Long, 
+          "unit", 
+          each if [metric] = "prices"        then "USD per coin" 
+               else if [metric] = "market_caps"   then "USD total" 
+               else if [metric] = "total_volumes" then "USD traded" 
+               else null, 
+          type text 
+        ), 
+
+      // Order & types 
+      Reordered = Table.ReorderColumns(WithUnit, {"asset","type","metric","date","value","unit"}) 
+    in 
+      Reordered, 
+
+  // Apply to all matching tbl_* sheets 
+  Added = 
+    Table.AddColumn( 
+      CryptoTables, 
+      "Tidy", 
+      each fxNormalizeCrypto([Content], Text.AfterDelimiter([Name], "tbl_")) 
+    ), 
+
+  Combined = Table.Combine(Added[Tidy]), 
+
+  // Final types & sort (value as Currency.Type like qAllCoins) 
+  FinalTyped = 
+    Table.TransformColumnTypes( 
+      Combined, 
+      { 
+        {"asset", type text}, 
+        {"type", type text}, 
+        {"metric", type text}, 
+        {"date", type date}, 
+        {"value", Currency.Type}, 
+        {"unit", type text} 
+      } 
+    ), 
+
+  FinalSorted = Table.Sort(FinalTyped, {{"date", Order.Descending}, {"asset", Order.Ascending}, {"metric", Order.Ascending}}) 
+
+in 
+  FinalSorted
